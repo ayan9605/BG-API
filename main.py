@@ -39,7 +39,7 @@ async def lifespan(app: FastAPI):
     # Startup: Load rembg model once
     logger.info("🚀 Starting up: Loading rembg model...")
     try:
-        model_session = new_session("u2net")
+        model_session = new_session("u2netp")
         logger.info("✅ Model loaded successfully")
     except Exception as e:
         logger.error(f"❌ Failed to load model: {e}")
