@@ -1,5 +1,6 @@
 import io
 import logging
+import os  # ADD THIS IMPORT
 import signal
 import sys
 from contextlib import asynccontextmanager
@@ -26,7 +27,16 @@ model_session: Optional[object] = None
 
 # Configuration
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
-ALLOWED_EXTENSIONS = {"image/jpeg", "image/jpg", "image/png"}
+
+# Expanded list of supported image formats (PIL/Pillow supported)
+ALLOWED_EXTENSIONS = {
+    "image/jpeg", "image/jpg", "image/png", "image/gif", 
+    "image/bmp", "image/tiff", "image/webp", "image/x-icon",
+    "image/vnd.microsoft.icon", "image/avif", "image/heic",
+    "image/heif", "image/x-tga", "image/x-pcx", "image/x-portable-pixmap",
+    "image/x-portable-graymap", "image/x-portable-bitmap",
+    "image/x-portable-anymap", "image/x-ms-bmp"
+}
 
 
 @asynccontextmanager
@@ -76,14 +86,20 @@ def validate_image(file: UploadFile) -> None:
     """
     Validate uploaded file type and size
     """
-    # Check content type
-    if file.content_type not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid file type. Allowed types: {', '.join(ALLOWED_EXTENSIONS)}"
-        )
+    # Check content type (relaxed for common formats)
+    if file.content_type and file.content_type not in ALLOWED_EXTENSIONS:
+        # Try to validate by file extension if content type check fails
+        if not any(file.filename.lower().endswith(ext) for ext in [
+            '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', 
+            '.tif', '.webp', '.ico', '.avif', '.heic', '.heif',
+            '.tga', '.pcx', '.ppm', '.pgm', '.pbm', '.pnm'
+        ]):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid file type. Supported formats: JPEG, PNG, GIF, BMP, TIFF, WebP, ICO, AVIF, and more"
+            )
     
-    # Check file size (read in chunks to avoid loading entire file into memory)
+    # Check file size
     file.file.seek(0, 2)  # Seek to end
     file_size = file.file.tell()
     file.file.seek(0)  # Reset to beginning
@@ -103,14 +119,38 @@ def validate_image(file: UploadFile) -> None:
 
 async def process_image(file_content: bytes) -> bytes:
     """
-    Process image and remove background
+    Process image and remove background - supports all PIL formats
     """
     try:
-        # Open image
+        # Open image (PIL auto-detects format)
         input_image = Image.open(io.BytesIO(file_content))
         
         # Log image info
         logger.info(f"Processing image: {input_image.format} {input_image.size} {input_image.mode}")
+        
+        # Convert image mode if necessary for rembg compatibility
+        # rembg works best with RGB or RGBA images
+        if input_image.mode not in ('RGB', 'RGBA'):
+            if input_image.mode == 'P':  # Palette mode
+                # Check if image has transparency
+                if 'transparency' in input_image.info:
+                    input_image = input_image.convert('RGBA')
+                else:
+                    input_image = input_image.convert('RGB')
+            elif input_image.mode in ('L', 'LA'):  # Grayscale
+                if input_image.mode == 'LA':
+                    input_image = input_image.convert('RGBA')
+                else:
+                    input_image = input_image.convert('RGB')
+            elif input_image.mode == '1':  # Binary
+                input_image = input_image.convert('RGB')
+            elif input_image.mode == 'CMYK':
+                input_image = input_image.convert('RGB')
+            else:
+                # For any other mode, try converting to RGB
+                input_image = input_image.convert('RGB')
+            
+            logger.info(f"Converted image mode to: {input_image.mode}")
         
         # Remove background using preloaded model
         output_image = remove(input_image, session=model_session)
@@ -139,6 +179,10 @@ async def root():
         "name": "AI Background Removal API",
         "version": "1.0.0",
         "status": "running",
+        "supported_formats": [
+            "JPEG", "PNG", "GIF", "BMP", "TIFF", "WebP", 
+            "ICO", "AVIF", "HEIC", "TGA", "PCX", "PPM", "PGM", "PBM"
+        ],
         "endpoints": {
             "remove_background": "/api/remove-bg",
             "documentation": "/docs",
@@ -163,8 +207,11 @@ async def remove_background(file: UploadFile = File(...)):
     """
     Remove background from uploaded image
     
+    Supports all major image formats: JPEG, PNG, GIF, BMP, TIFF, WebP, 
+    ICO, AVIF, HEIC, TGA, PCX, PPM, and more.
+    
     Args:
-        file: Uploaded image file (JPG/PNG, max 10MB)
+        file: Uploaded image file (max 10MB)
     
     Returns:
         Transparent PNG image stream
@@ -229,10 +276,12 @@ signal.signal(signal.SIGINT, handle_shutdown)
 
 if __name__ == "__main__":
     import uvicorn
+    # FIXED: Read PORT from environment variable (Render requirement)
+    port = int(os.environ.get("PORT", 8000))
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=8000,
+        port=port,
         reload=False,
         log_level="info"
     )
