@@ -12,6 +12,10 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from PIL import Image
 from rembg import remove, new_session
 
+# Added imports for memory handling
+import torch
+import gc
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -30,7 +34,7 @@ MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 
 # Expanded list of supported image formats (PIL/Pillow supported)
 ALLOWED_EXTENSIONS = {
-    "image/jpeg", "image/jpg", "image/png", "image/gif", 
+    "image/jpeg", "image/jpg", "image/png", "image/gif",
     "image/bmp", "image/tiff", "image/webp", "image/x-icon",
     "image/vnd.microsoft.icon", "image/avif", "image/heic",
     "image/heif", "image/x-tga", "image/x-pcx", "image/x-portable-pixmap",
@@ -45,21 +49,37 @@ async def lifespan(app: FastAPI):
     Lifespan context manager for startup and shutdown events
     """
     global model_session
-    
+
     # Startup: Load rembg model once
     logger.info("🚀 Starting up: Loading rembg model...")
     try:
+        # Disable gradient tracking to save memory
+        torch.set_grad_enabled(False)
         model_session = new_session("u2netp")
+
+        # If the session exposes a model attribute, put it in eval mode
+        try:
+            if hasattr(model_session, "model") and model_session.model is not None:
+                model_session.model.eval()
+        except Exception:
+            # non-fatal: continue even if we can't set eval()
+            logger.debug("Could not call model_session.model.eval(); continuing.")
+
         logger.info("✅ Model loaded successfully")
     except Exception as e:
         logger.error(f"❌ Failed to load model: {e}")
         raise
-    
+
     yield
-    
+
     # Shutdown: Cleanup
     logger.info("🛑 Shutting down gracefully...")
     model_session = None
+    # force a GC on shutdown
+    try:
+        gc.collect()
+    except Exception:
+        pass
 
 
 # Initialize FastAPI app
@@ -90,7 +110,7 @@ def validate_image(file: UploadFile) -> None:
     if file.content_type and file.content_type not in ALLOWED_EXTENSIONS:
         # Try to validate by file extension if content type check fails
         if not any(file.filename.lower().endswith(ext) for ext in [
-            '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', 
+            '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff',
             '.tif', '.webp', '.ico', '.avif', '.heic', '.heif',
             '.tga', '.pcx', '.ppm', '.pgm', '.pbm', '.pnm'
         ]):
@@ -98,18 +118,18 @@ def validate_image(file: UploadFile) -> None:
                 status_code=400,
                 detail=f"Invalid file type. Supported formats: JPEG, PNG, GIF, BMP, TIFF, WebP, ICO, AVIF, and more"
             )
-    
+
     # Check file size
     file.file.seek(0, 2)  # Seek to end
     file_size = file.file.tell()
     file.file.seek(0)  # Reset to beginning
-    
+
     if file_size > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=400,
             detail=f"File too large. Maximum size: {MAX_FILE_SIZE / (1024*1024):.1f}MB"
         )
-    
+
     if file_size == 0:
         raise HTTPException(
             status_code=400,
@@ -121,13 +141,18 @@ async def process_image(file_content: bytes) -> bytes:
     """
     Process image and remove background - supports all PIL formats
     """
+    # Define locals to be cleaned up in finally
+    input_image = None
+    output_image = None
+    output_buffer = None
+
     try:
         # Open image (PIL auto-detects format)
         input_image = Image.open(io.BytesIO(file_content))
-        
+
         # Log image info
         logger.info(f"Processing image: {input_image.format} {input_image.size} {input_image.mode}")
-        
+
         # Convert image mode if necessary for rembg compatibility
         # rembg works best with RGB or RGBA images
         if input_image.mode not in ('RGB', 'RGBA'):
@@ -149,25 +174,56 @@ async def process_image(file_content: bytes) -> bytes:
             else:
                 # For any other mode, try converting to RGB
                 input_image = input_image.convert('RGB')
-            
+
             logger.info(f"Converted image mode to: {input_image.mode}")
-        
+
         # Remove background using preloaded model
         output_image = remove(input_image, session=model_session)
-        
+
         # Convert to PNG with transparency
         output_buffer = io.BytesIO()
         output_image.save(output_buffer, format="PNG", optimize=True)
         output_buffer.seek(0)
-        
+
         return output_buffer.getvalue()
-        
+
+    except HTTPException:
+        # re-raise HTTPException as-is
+        raise
     except Exception as e:
         logger.error(f"Error processing image: {e}")
         raise HTTPException(
             status_code=500,
             detail=f"Failed to process image: {str(e)}"
         )
+    finally:
+        # Cleanup / free memory
+        try:
+            if input_image is not None:
+                try:
+                    input_image.close()
+                except Exception:
+                    pass
+                del input_image
+            if output_image is not None:
+                try:
+                    output_image.close()
+                except Exception:
+                    pass
+                del output_image
+            if output_buffer is not None:
+                try:
+                    output_buffer.close()
+                except Exception:
+                    pass
+                del output_buffer
+        except Exception:
+            pass
+        # Force garbage collection to free memory immediately
+        try:
+            gc.collect()
+        except Exception:
+            pass
 
 
 @app.get("/")
@@ -180,7 +236,7 @@ async def root():
         "version": "1.0.0",
         "status": "running",
         "supported_formats": [
-            "JPEG", "PNG", "GIF", "BMP", "TIFF", "WebP", 
+            "JPEG", "PNG", "GIF", "BMP", "TIFF", "WebP",
             "ICO", "AVIF", "HEIC", "TGA", "PCX", "PPM", "PGM", "PBM"
         ],
         "endpoints": {
@@ -206,30 +262,30 @@ async def health_check():
 async def remove_background(file: UploadFile = File(...)):
     """
     Remove background from uploaded image
-    
-    Supports all major image formats: JPEG, PNG, GIF, BMP, TIFF, WebP, 
+
+    Supports all major image formats: JPEG, PNG, GIF, BMP, TIFF, WebP,
     ICO, AVIF, HEIC, TGA, PCX, PPM, and more.
-    
+
     Args:
         file: Uploaded image file (max 10MB)
-    
+
     Returns:
         Transparent PNG image stream
     """
     logger.info(f"📥 Received request: {file.filename} ({file.content_type})")
-    
+
     try:
         # Validate file
         validate_image(file)
-        
+
         # Read file content
         file_content = await file.read()
-        
+
         # Process image (remove background)
         output_bytes = await process_image(file_content)
-        
+
         logger.info(f"✅ Successfully processed: {file.filename}")
-        
+
         # Return as streaming response
         return StreamingResponse(
             io.BytesIO(output_bytes),
@@ -238,7 +294,7 @@ async def remove_background(file: UploadFile = File(...)):
                 "Content-Disposition": f"attachment; filename=nobg_{file.filename.rsplit('.', 1)[0]}.png"
             }
         )
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -283,5 +339,6 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port,
         reload=False,
+        workers=1,  # limit to single worker to reduce memory duplication
         log_level="info"
     )
